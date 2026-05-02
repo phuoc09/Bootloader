@@ -222,14 +222,12 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+	send_byte(ACK);
 	bootloader_loop();
 	
 	
 	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, 1);
 	HAL_Delay(2000);
-	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, 0);
-	HAL_Delay(2000);	
-	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, 1);
 	enter_to_application();
   /* USER CODE END 2 */
 

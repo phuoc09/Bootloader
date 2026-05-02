@@ -141,7 +141,7 @@ void sendFirmwareToSTM32()
 void setup()
 {
     // UART0 (USB) cho log debug
-    Serial.begin(9600);
+    Serial.begin(115200);
 
     // UART1 cho STM32 — khai báo pin RX/TX rõ ràng giống file 1
     Serial1.begin(STM_BAUD, SERIAL_8N1, STM_RXPIN, STM_TXPIN);

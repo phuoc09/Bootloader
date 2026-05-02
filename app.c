@@ -87,7 +87,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
-
+	SCB->VTOR = 0x0800C800;
   /* USER CODE END 2 */
 
   /* Infinite loop */
