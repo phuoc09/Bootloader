@@ -223,7 +223,7 @@ int main(void)
   MX_GPIO_Init();
 	DWT_Init();
   /* USER CODE BEGIN 2 */
-	SCB->VTOR = 0x0800C800;
+	SCB->VTOR = 0x08003000;
   confirm_app_valid('B');
   /* Bring up DWT for us-precision delays */
   
