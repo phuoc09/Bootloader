@@ -2,7 +2,10 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Smooth LED breathing effect on PA0
+  *                   - Software PWM ~ 1 kHz (no hardware timer used)
+  *                   - DWT cycle counter for microsecond-precision delay
+  *                   - Gamma-corrected lookup table for natural-looking breath
   ******************************************************************************
   * @attention
   *
@@ -18,7 +21,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "flash.h"
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -32,6 +35,22 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/* PWM configuration:
+ *   PWM_PERIOD_US = 1000 us  -> PWM frequency = 1 kHz (flicker-free)
+ *   PWM_LEVELS    = 100      -> duty resolution: 1% steps, 10 us per tick
+ */
+#define PWM_PERIOD_US     1000U
+#define PWM_LEVELS        100U
+#define PWM_TICK_US       (PWM_PERIOD_US / PWM_LEVELS)   /* 10 us */
+
+/* Breath timing:
+ *   PWM_CYCLES_PER_STEP cycles are emitted at each duty value before stepping.
+ *   Total breath cycle = 2 * BREATH_TABLE_SIZE * PWM_CYCLES_PER_STEP * PWM_PERIOD_US
+ *   With table size 128 and 12 cycles per step: 2*128*12*1ms = ~3.07 s per full breath.
+ */
+#define PWM_CYCLES_PER_STEP   12U
+#define BREATH_TABLE_SIZE     128U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,15 +62,94 @@
 
 /* USER CODE BEGIN PV */
 
+/* Gamma-corrected breath table (index 0..127 -> duty 0..PWM_LEVELS).
+ * Built from a half-sine raised to gamma 2.2 to match human eye perception:
+ *   duty[i] = round( PWM_LEVELS * ( sin(pi * i / N)^2.2 ) )    for i in [0, N)
+ *
+ * Eye sees this as a soft, natural inhale/exhale.
+ */
+static const uint8_t breath_lut[BREATH_TABLE_SIZE] = {
+      0,   0,   0,   0,   0,   0,   0,   0,
+      0,   0,   1,   1,   1,   1,   2,   2,
+      2,   3,   3,   4,   4,   5,   5,   6,
+      6,   7,   8,   9,   9,  10,  11,  12,
+     13,  14,  15,  16,  17,  18,  20,  21,
+     22,  24,  25,  27,  28,  30,  31,  33,
+     35,  36,  38,  40,  42,  44,  45,  47,
+     49,  51,  53,  55,  57,  59,  61,  63,
+     65,  67,  69,  71,  73,  75,  77,  79,
+     81,  82,  84,  86,  88,  89,  91,  92,
+     93,  95,  96,  97,  98,  99, 100, 100,
+    100, 100, 100, 100, 100, 100, 100, 100,
+    100, 100, 100, 100, 100, 100, 100, 100,
+    100, 100, 100, 100, 100, 100, 100, 100,
+    100, 100, 100, 100, 100, 100, 100, 100,
+    100, 100, 100, 100, 100, 100, 100, 100,
+};
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 /* USER CODE BEGIN PFP */
+static void DWT_Init(void);
+static inline void DWT_Delay_us(uint32_t us);
+static void Breath_PWM_Cycle(uint8_t duty);
+/* USER CODE END PFP */
 
-// Hàm t? xác nh?n App dã ch?y ?n d?nh
-// Ð?m b?o b?n dã include thu vi?n flash c?a b?n ? dây
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/**
+  * @brief Enable the DWT cycle counter (Cortex-M3+).
+  *        Used as a high-resolution time base for microsecond delays.
+  */
+static void DWT_Init(void)
+{
+    /* Unlock DWT (some debug tools lock it) */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+
+    /* Reset and enable cycle counter */
+    DWT->CYCCNT = 0U;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+/**
+  * @brief Busy-wait for `us` microseconds using DWT cycle counter.
+  *        Resolution = 1 CPU cycle (~13.9 ns @ 72 MHz).
+  *        Handles 32-bit wrap-around correctly via unsigned subtraction.
+  */
+static inline void DWT_Delay_us(uint32_t us)
+{
+    uint32_t start  = DWT->CYCCNT;
+    uint32_t cycles = us * (SystemCoreClock / 1000000U);
+    while ((DWT->CYCCNT - start) < cycles) { /* spin */ }
+}
+
+/**
+  * @brief Emit one PWM cycle on PA0 for the given duty (0..PWM_LEVELS).
+  *        Cycle length = PWM_PERIOD_US (1 ms by default -> 1 kHz).
+  */
+static void Breath_PWM_Cycle(uint8_t duty)
+{
+    if (duty > PWM_LEVELS) duty = PWM_LEVELS;
+
+    uint32_t on_us  = (uint32_t)duty * PWM_TICK_US;
+    uint32_t off_us = PWM_PERIOD_US - on_us;
+
+    if (on_us > 0U)
+    {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
+        DWT_Delay_us(on_us);
+    }
+
+    if (off_us > 0U)
+    {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+        DWT_Delay_us(off_us);
+    }
+}
 
 #define ADDR_OTA_INFO 0x08002000
 
@@ -92,11 +190,6 @@ void confirm_app_valid(char my_slot) {
     }
 }
 
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-
 /* USER CODE END 0 */
 
 /**
@@ -105,6 +198,7 @@ void confirm_app_valid(char my_slot) {
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -127,15 +221,13 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  
+	DWT_Init();
   /* USER CODE BEGIN 2 */
-  
-  // 1. Relocate the Vector Table to the correct App address
-  SCB->VTOR = 0x08005000;
-	
-  // 2. Confirm the App has booted successfully ONLY ONCE before the main loop
+	SCB->VTOR = 0x0800C800;
   confirm_app_valid('B');
-	
+  /* Bring up DWT for us-precision delays */
+  
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -143,14 +235,28 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-    
-    // Application task: Blink LED
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, 1);
-    HAL_Delay(199);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, 0);
-    HAL_Delay(199);
-    
+
     /* USER CODE BEGIN 3 */
+
+    /* Inhale: walk the LUT 0 -> N-1 */
+    for (uint32_t i = 0; i < BREATH_TABLE_SIZE; ++i)
+    {
+        uint8_t duty = breath_lut[i];
+        for (uint32_t c = 0; c < PWM_CYCLES_PER_STEP; ++c)
+        {
+            Breath_PWM_Cycle(duty);
+        }
+    }
+
+    /* Exhale: walk the LUT N-1 -> 0 */
+    for (int32_t i = (int32_t)BREATH_TABLE_SIZE - 1; i >= 0; --i)
+    {
+        uint8_t duty = breath_lut[i];
+        for (uint32_t c = 0; c < PWM_CYCLES_PER_STEP; ++c)
+        {
+            Breath_PWM_Cycle(duty);
+        }
+    }
   }
   /* USER CODE END 3 */
 }
@@ -217,7 +323,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  /* HIGH speed -> clean PWM edges at 1 kHz */
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */

@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "flash.h"
+#include "boot_sim.h" 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -56,11 +57,115 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define ADDR_APP_PROGRAM 0x800C800
+#define ADDR_OTA_INFO    0x08002000 // Format: [Ver A, Stat A, Try A, Ver B, Stat B, Try B]
+#define ADDR_APP_1       0x08003000 // App 1 (Slot A) Address
+#define ADDR_APP_2       0x08005000 // App 2 (Slot B) Address
+#define APP_SIZE         0x2000     // 8KB per partition
+
+// OTA States Definition
+#define OTA_STATE_VALID   0x01
+#define OTA_STATE_PENDING 0x02
+#define OTA_STATE_DOWNLOADING 0x03 
+#define OTA_STATE_EMPTY   0xFF
+
 typedef void (*pFunction)(void);
 
+uint8_t active_slot = 'A'; 
+uint8_t app_version = 1;
+uint8_t skip_timeout = 0;
+
+// Erase specific application slot dynamically (1KB pages)
+void flash_erase_slot(uint32_t start_addr, uint32_t size)
+{
+    for (uint32_t offset = 0; offset < size; offset += 1024)
+    {
+        flash_erase(start_addr + offset);
+    }
+}
+
+// ---------------------------------------------------------
+// CORE ROLLBACK & BOOT LOGIC
+// ---------------------------------------------------------
+// ---------------------------------------------------------
+// CORE ROLLBACK & BOOT LOGIC
+// ---------------------------------------------------------
+void check_and_prepare_boot()
+{
+    uint8_t verA   = *(__IO uint8_t*)(ADDR_OTA_INFO);
+    uint8_t stateA = *(__IO uint8_t*)(ADDR_OTA_INFO + 1);
+    uint8_t tryA   = *(__IO uint8_t*)(ADDR_OTA_INFO + 2);
+    
+    uint8_t verB   = *(__IO uint8_t*)(ADDR_OTA_INFO + 3);
+    uint8_t stateB = *(__IO uint8_t*)(ADDR_OTA_INFO + 4);
+    uint8_t tryB   = *(__IO uint8_t*)(ADDR_OTA_INFO + 5);
+    
+    uint8_t need_update = 0;
+
+    // 1. Initial Format Check
+    if (stateA == 0xFF && stateB == 0xFF) {
+        verA = 1; stateA = OTA_STATE_VALID; tryA = 0;
+        verB = 0; stateB = OTA_STATE_EMPTY; tryB = 0;
+        need_update = 1;
+    }
+
+		// 2. ROLLBACK & DOWNLOADING CHECK:
+    // - N?u PENDING và try >= 1 -> App b? crash khi ch?y th?!
+    // - N?u DOWNLOADING -> B? m?t di?n khi dang n?p OTA d? dang!
+    if ((stateA == OTA_STATE_PENDING && tryA >= 1) || stateA == OTA_STATE_DOWNLOADING) {
+        stateA = OTA_STATE_EMPTY; verA = 0; tryA = 0; // Ðánh d?u là tr?ng
+        flash_unlock();
+        flash_erase_slot(ADDR_APP_1, APP_SIZE);       // Xóa ngay vùng App A b? l?i/n?p thi?u
+        flash_lock();
+        need_update = 1;
+    }
+    if ((stateB == OTA_STATE_PENDING && tryB >= 1) || stateB == OTA_STATE_DOWNLOADING) {
+        stateB = OTA_STATE_EMPTY; verB = 0; tryB = 0; // Ðánh d?u là tr?ng
+        flash_unlock();
+        flash_erase_slot(ADDR_APP_2, APP_SIZE);       // Xóa ngay vùng App B b? l?i/n?p thi?u
+        flash_lock();
+        need_update = 1;
+    }
+
+    // 3. Select Active Slot
+    if (stateA == OTA_STATE_PENDING) {
+        active_slot = 'A'; app_version = verA;
+    } else if (stateB == OTA_STATE_PENDING) {
+        active_slot = 'B'; app_version = verB;
+    } else {
+        active_slot = 'A'; app_version = verA;
+        if (stateA == OTA_STATE_EMPTY && stateB != OTA_STATE_EMPTY) {
+            active_slot = 'B'; app_version = verB;
+        } else if (stateB != OTA_STATE_EMPTY && verB > verA) {
+            active_slot = 'B'; app_version = verB;
+        }
+    }
+
+    // 4. Set try_to_boot = 1 for the selected slot AND trigger skip_timeout
+    if (active_slot == 'A' && stateA == OTA_STATE_PENDING && tryA == 0) {
+        tryA = 1;
+        need_update = 1;
+        skip_timeout = 1; // <--- B?T C? B? QUA 10s
+    } else if (active_slot == 'B' && stateB == OTA_STATE_PENDING && tryB == 0) {
+        tryB = 1;
+        need_update = 1;
+        skip_timeout = 1; // <--- B?T C? B? QUA 10s
+    }
+
+    // 5. Save OTA info to flash
+    if (need_update) {
+        flash_unlock();
+        flash_erase(ADDR_OTA_INFO);
+        uint8_t info_buf[6] = {verA, stateA, tryA, verB, stateB, tryB};
+        flash_write(ADDR_OTA_INFO, info_buf, 6);
+        flash_lock();
+    }
+}
+
+// Dynamic boot to the active application
 void enter_to_application()
 {
+    uint32_t boot_addr = (active_slot == 'B') ? ADDR_APP_2 : ADDR_APP_1;
+    
     HAL_RCC_DeInit();
     HAL_DeInit();
 
@@ -68,126 +173,181 @@ void enter_to_application()
                     SCB_SHCSR_BUSFAULTENA_Msk |
                     SCB_SHCSR_MEMFAULTENA_Msk);
 
-    __set_MSP(*(__IO uint32_t *)ADDR_APP_PROGRAM);
+    __set_MSP(*(__IO uint32_t *)boot_addr);
 
-    pFunction app_entry = (pFunction)(*(__IO uint32_t *)(ADDR_APP_PROGRAM + 4));
+    pFunction app_entry = (pFunction)(*(__IO uint32_t *)(boot_addr + 4));
     app_entry();
 }
+
 #define START_BYTE 0xAA
 #define ACK 0x79
 #define NACK 0x1F
 #define BLOCK_SIZE 256
 
-#define START_PAGE 50
-#define END_PAGE 127
-
-void flash_erase_range_by_page()
-{
-    for (uint32_t page = START_PAGE; page <= END_PAGE; page++)
-    {
-        uint32_t addr = 0x08000000 + page * 1024;
-        flash_erase(addr);
-    }
-}
-
 uint16_t simpleCRC(uint8_t *data, uint16_t len)
 {
     uint16_t crc = 0;
-    for (uint16_t i = 0; i < len; i++)
-    {
-        crc += data[i];
-    }
+    for (uint16_t i = 0; i < len; i++) { crc += data[i]; }
     return crc;
 }
 
-void send_byte(uint8_t byte)
-{
-    HAL_UART_Transmit(&huart1, &byte, 1, HAL_MAX_DELAY);
-}
-
-uint8_t receive_byte(uint8_t *byte, uint32_t timeout)
-{
-    return HAL_UART_Receive(&huart1, byte, 1, timeout);
-}
+void send_byte(uint8_t byte) { HAL_UART_Transmit(&huart1, &byte, 1, HAL_MAX_DELAY); }
+uint8_t receive_byte(uint8_t *byte, uint32_t timeout) { return HAL_UART_Receive(&huart1, byte, 1, timeout); }
 
 uint8_t header[3];
 uint8_t data[BLOCK_SIZE];
 uint8_t crc_buf[2];
 uint16_t crc_calc;
 uint16_t crc_recv;
+
 void bootloader_loop()
 {
-    uint32_t app_address = ADDR_APP_PROGRAM;
+    uint32_t app_address = 0;
     uint16_t len;
-    for (int b = 0; b < 3; b++)
-    {
-        header[b] = 0;
+    uint32_t start_time = HAL_GetTick(); 
+    uint8_t ota_active = 0;              
+
+    for (int b = 0; b < 3; b++) { header[b] = 0; }
+    
+    // Process Rollback & Select Slot
+    check_and_prepare_boot();
+
+    // ==========================================
+    // N?U V?A N?P XONG (T?c là m?i tang try t? 0 lên 1) -> B? QUA CH? 10S
+    // ==========================================
+    if (skip_timeout == 1) {
+        skip_timeout = 0; // Reset l?i c? (dù sau dó nh?y vào app luôn)
+        return;           // Thoát th?ng kh?i bootloader_loop d? vào App ngay l?p t?c
     }
-    flash_unlock();
-    flash_erase_range_by_page();
+
+    // Turn ON LED (PA0) for 10s wait
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
 
     while (1)
     {
-        if (receive_byte(&header[0], 5000) != HAL_OK || header[0] != START_BYTE)
+        // 1. TIMEOUT LOGIC
+        if (!ota_active)
         {
-            continue;
+            if (HAL_GetTick() - start_time >= 10000) break; // Timeout -> Jump to App
+            if (receive_byte(&header[0], 100) != HAL_OK || header[0] != START_BYTE) continue;
+            ota_active = 1;
+        }
+        else
+        {
+            if (receive_byte(&header[0], 5000) != HAL_OK || header[0] != START_BYTE) continue;
         }
 
-        if (HAL_UART_Receive(&huart1, &header[1], 2, 1000) != HAL_OK)
-        {
-            send_byte(NACK);
-            continue;
-        }
-
+        // 2. PACKET PARSING
+        if (HAL_UART_Receive(&huart1, &header[1], 2, 1000) != HAL_OK) { send_byte(NACK); continue; }
         len = (header[1] << 8) | header[2];
-        if (len > BLOCK_SIZE)
-        {
-            send_byte(NACK);
-            continue;
-        }
+        if (len > BLOCK_SIZE) { send_byte(NACK); continue; }
+        
+        // K?T THÚC NH?N FILE (Len == 0) -> RESET NGAY L?P T?C
+				if (len == 0) { 
+            // 1. Ð?c l?i 6 byte thông tin OTA hi?n t?i t? Flash
+            uint8_t verA   = *(__IO uint8_t*)(ADDR_OTA_INFO);
+            uint8_t stateA = *(__IO uint8_t*)(ADDR_OTA_INFO + 1);
+            uint8_t tryA   = *(__IO uint8_t*)(ADDR_OTA_INFO + 2);
+            uint8_t verB   = *(__IO uint8_t*)(ADDR_OTA_INFO + 3);
+            uint8_t stateB = *(__IO uint8_t*)(ADDR_OTA_INFO + 4);
+            uint8_t tryB   = *(__IO uint8_t*)(ADDR_OTA_INFO + 5);
 
-        if (len == 0)
-        {
-            send_byte(ACK);
-            break;
-        }
+            uint8_t need_update = 0;
 
-        if (HAL_UART_Receive(&huart1, data, len, 1000) != HAL_OK)
-        {
-            send_byte(NACK);
-            continue;
-        }
+            // 2. Tìm xem vùng nào dang DOWNLOADING thì ch?t thành PENDING
+            if (stateA == OTA_STATE_DOWNLOADING) {
+                stateA = OTA_STATE_PENDING;
+                need_update = 1;
+            } else if (stateB == OTA_STATE_DOWNLOADING) {
+                stateB = OTA_STATE_PENDING;
+                need_update = 1;
+            }
 
-        if (HAL_UART_Receive(&huart1, crc_buf, 2, 500) != HAL_OK)
-        {
-            send_byte(NACK);
-            continue;
+            // 3. Ghi dè tr?ng thái PENDING chính th?c vào Flash
+            if (need_update) {
+                flash_unlock();
+                flash_erase(ADDR_OTA_INFO);
+                uint8_t info_buf[6] = {verA, stateA, tryA, verB, stateB, tryB};
+                flash_write(ADDR_OTA_INFO, info_buf, 6);
+                flash_lock();
+            }
+
+            // 4. Báo cáo hoàn t?t và Reset ph?n c?ng
+            send_byte(ACK); 
+            HAL_Delay(10);        
+            NVIC_SystemReset();   
         }
+        
+        if (HAL_UART_Receive(&huart1, data, len, 1000) != HAL_OK) { send_byte(NACK); continue; }
+        if (HAL_UART_Receive(&huart1, crc_buf, 2, 500) != HAL_OK) { send_byte(NACK); continue; }
 
         crc_recv = (crc_buf[0] << 8) | crc_buf[1];
         crc_calc = simpleCRC(data, len);
+        if (crc_recv != crc_calc) { send_byte(NACK); continue; }
 
-        if (crc_recv != crc_calc)
+        // COMMAND PROCESSING
+        if (len == 1 && data[0] == 0x01) 
         {
-            send_byte(NACK);
+            send_byte(active_slot);
             continue;
         }
+				else if (len == 2) 
+        {
+            uint8_t target_slot = data[0];
+            uint8_t version = data[1];
 
-        flash_write(app_address, data, len);
-        app_address += len;
+            if (target_slot == 'A') app_address = ADDR_APP_1;
+            else if (target_slot == 'B') app_address = ADDR_APP_2;
+            else app_address = ADDR_APP_1; 
 
-        send_byte(ACK);
+            // Read current 6 bytes
+            uint8_t verA   = *(__IO uint8_t*)(ADDR_OTA_INFO);
+            uint8_t stateA = *(__IO uint8_t*)(ADDR_OTA_INFO + 1);
+            uint8_t tryA   = *(__IO uint8_t*)(ADDR_OTA_INFO + 2);
+            uint8_t verB   = *(__IO uint8_t*)(ADDR_OTA_INFO + 3);
+            uint8_t stateB = *(__IO uint8_t*)(ADDR_OTA_INFO + 4);
+            uint8_t tryB   = *(__IO uint8_t*)(ADDR_OTA_INFO + 5);
+
+            // BU?C M?I: Ðánh d?u Firmware là DOWNLOADING trong lúc ch? n?p các block
+            if (target_slot == 'A') {
+                verA = version; stateA = OTA_STATE_DOWNLOADING; tryA = 0; // <-- Ð?i thành DOWNLOADING
+            } else {
+                verB = version; stateB = OTA_STATE_DOWNLOADING; tryB = 0; // <-- Ð?i thành DOWNLOADING
+            }
+
+            flash_unlock();
+            flash_erase_slot(app_address, APP_SIZE);
+            flash_erase(ADDR_OTA_INFO);
+            uint8_t info_buf[6] = {verA, stateA, tryA, verB, stateB, tryB};
+            flash_write(ADDR_OTA_INFO, info_buf, 6);
+            
+            active_slot = target_slot; 
+            app_version = version;
+            
+            send_byte(ACK);
+            continue;
+        }
+        else 
+        {
+            if (app_address != 0) 
+            {
+                flash_write(app_address, data, len);
+                app_address += len;
+            }
+            send_byte(ACK);
+        }
     }
 
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
     flash_lock();
 }
 
 uint8_t mData[10] ={9,8,7,6,5,4,3,2,1,0};
 void writeData(){
-	flash_unlock();
-	flash_erase(0x0801FC00);
-	flash_write(0x0801FC00,mData,10);
-	flash_lock();
+  flash_unlock();
+  flash_erase(0x0801FC00);
+  flash_write(0x0801FC00,mData,10);
+  flash_lock();
 }
 /* USER CODE END 0 */
 
@@ -197,7 +357,6 @@ void writeData(){
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -206,7 +365,7 @@ int main(void)
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
+	
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
@@ -221,14 +380,22 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  
   /* USER CODE BEGIN 2 */
-	send_byte(ACK);
-	bootloader_loop();
-	
-	
-	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, 1);
-	HAL_Delay(2000);
-	enter_to_application();
+  
+  // Read memory state initially
+  //read_ota_info();
+	//flash_unlock();
+  //flash_erase_slot(0x8002000, 0x10000);
+	//flash_lock();
+  send_byte(ACK);
+  
+  // Loop handles 10s wait, LED toggle, and OTA process
+  bootloader_loop();
+  
+  // Enter the correct application (A or B)
+  enter_to_application();
+  
   /* USER CODE END 2 */
 
   /* Infinite loop */
